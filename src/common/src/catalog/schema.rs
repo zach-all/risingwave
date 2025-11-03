@@ -410,3 +410,115 @@ pub mod test_utils {
         decimal_n::<3>()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_field_with_constraints() {
+        // Test creating a field with constraints
+        let field = Field::new("id", DataType::Int32)
+            .with_not_null(true)
+            .with_primary_key(true)
+            .with_description("Primary key identifier");
+
+        assert_eq!(field.name, "id");
+        assert_eq!(field.is_not_null, Some(true));
+        assert_eq!(field.is_primary_key, Some(true));
+        assert_eq!(field.description, Some("Primary key identifier".to_string()));
+        assert_eq!(field.foreign_key, None);
+    }
+
+    #[test]
+    fn test_field_with_foreign_key() {
+        // Test creating a field with foreign key
+        let field = Field::new("user_id", DataType::Int32)
+            .with_not_null(true)
+            .with_foreign_key("users(id)")
+            .with_description("Reference to users table");
+
+        assert_eq!(field.name, "user_id");
+        assert_eq!(field.is_not_null, Some(true));
+        assert_eq!(field.foreign_key, Some("users(id)".to_string()));
+        assert_eq!(field.description, Some("Reference to users table".to_string()));
+        assert_eq!(field.is_primary_key, None);
+    }
+
+    #[test]
+    fn test_schema_with_description() {
+        // Test creating a schema with description
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int32).with_primary_key(true),
+            Field::new("name", DataType::Varchar),
+        ])
+        .with_description("User information table");
+
+        assert_eq!(schema.fields.len(), 2);
+        assert_eq!(schema.description, Some("User information table".to_string()));
+    }
+
+    #[test]
+    fn test_field_serialization_roundtrip() {
+        // Test that fields with constraints serialize and deserialize correctly
+        let original_field = Field::new("test_field", DataType::Varchar)
+            .with_not_null(true)
+            .with_primary_key(false)
+            .with_foreign_key("ref_table(id)")
+            .with_description("Test description");
+
+        let pb_field = original_field.to_prost();
+        let deserialized_field = Field::from_prost(&pb_field);
+
+        assert_eq!(deserialized_field.name, original_field.name);
+        assert_eq!(deserialized_field.data_type, original_field.data_type);
+        assert_eq!(deserialized_field.is_not_null, original_field.is_not_null);
+        assert_eq!(deserialized_field.is_primary_key, original_field.is_primary_key);
+        assert_eq!(deserialized_field.foreign_key, original_field.foreign_key);
+        assert_eq!(deserialized_field.description, original_field.description);
+    }
+
+    #[test]
+    fn test_backward_compatibility() {
+        // Test that fields without constraints still work
+        let field = Field::new("simple_field", DataType::Int32);
+
+        assert_eq!(field.name, "simple_field");
+        assert_eq!(field.is_not_null, None);
+        assert_eq!(field.is_primary_key, None);
+        assert_eq!(field.foreign_key, None);
+        assert_eq!(field.description, None);
+    }
+
+    #[test]
+    fn test_redshift_table_schema_example() {
+        // Example schema for Redshift table with constraints
+        let schema = Schema::new(vec![
+            Field::new("order_id", DataType::Int64)
+                .with_not_null(true)
+                .with_primary_key(true)
+                .with_description("Unique order identifier"),
+            Field::new("customer_id", DataType::Int64)
+                .with_not_null(true)
+                .with_foreign_key("customers(id)")
+                .with_description("Reference to customer"),
+            Field::new("order_date", DataType::Date)
+                .with_not_null(true)
+                .with_description("Date the order was placed"),
+            Field::new("total_amount", DataType::Decimal)
+                .with_description("Total order amount"),
+        ])
+        .with_description("Orders table with customer references");
+
+        assert_eq!(schema.fields.len(), 4);
+        assert_eq!(schema.description, Some("Orders table with customer references".to_string()));
+        
+        // Verify primary key field
+        assert_eq!(schema.fields[0].is_primary_key, Some(true));
+        assert_eq!(schema.fields[0].is_not_null, Some(true));
+        
+        // Verify foreign key field
+        assert_eq!(schema.fields[1].foreign_key, Some("customers(id)".to_string()));
+        assert_eq!(schema.fields[1].is_not_null, Some(true));
+    }
+}
