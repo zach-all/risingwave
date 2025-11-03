@@ -26,6 +26,14 @@ use crate::util::iter_util::ZipEqFast;
 pub struct Field {
     pub data_type: DataType,
     pub name: String,
+    /// Indicates if the field has a NOT NULL constraint
+    pub is_not_null: Option<bool>,
+    /// Indicates if the field is a primary key
+    pub is_primary_key: Option<bool>,
+    /// Foreign key reference (e.g., "other_table(column)")
+    pub foreign_key: Option<String>,
+    /// Optional description/comment for the field
+    pub description: Option<String>,
 }
 
 impl Field {
@@ -33,6 +41,10 @@ impl Field {
         Self {
             data_type,
             name: name.into(),
+            is_not_null: None,
+            is_primary_key: None,
+            foreign_key: None,
+            description: None,
         }
     }
 }
@@ -48,6 +60,10 @@ impl Field {
         PbField {
             data_type: Some(self.data_type.to_protobuf()),
             name: self.name.clone(),
+            is_not_null: self.is_not_null,
+            is_primary_key: self.is_primary_key,
+            foreign_key: self.foreign_key.clone(),
+            description: self.description.clone(),
         }
     }
 
@@ -55,6 +71,10 @@ impl Field {
         Field {
             data_type: DataType::from(pb.data_type.as_ref().unwrap()),
             name: pb.name.clone(),
+            is_not_null: pb.is_not_null,
+            is_primary_key: pb.is_primary_key,
+            foreign_key: pb.foreign_key.clone(),
+            description: pb.description.clone(),
         }
     }
 }
@@ -64,6 +84,10 @@ impl From<&ColumnDesc> for Field {
         Self {
             data_type: desc.data_type.clone(),
             name: desc.name.clone(),
+            is_not_null: None,
+            is_primary_key: None,
+            foreign_key: None,
+            description: desc.description.clone(),
         }
     }
 }
@@ -73,6 +97,10 @@ impl From<ColumnDesc> for Field {
         Self {
             data_type: column_desc.data_type,
             name: column_desc.name,
+            is_not_null: None,
+            is_primary_key: None,
+            foreign_key: None,
+            description: column_desc.description,
         }
     }
 }
@@ -82,6 +110,10 @@ impl From<&PbColumnDesc> for Field {
         Self {
             data_type: pb_column_desc.column_type.as_ref().unwrap().into(),
             name: pb_column_desc.name.clone(),
+            is_not_null: None,
+            is_primary_key: None,
+            foreign_key: None,
+            description: pb_column_desc.description.clone(),
         }
     }
 }
@@ -133,11 +165,13 @@ macro_rules! schema_unnamed {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Schema {
     pub fields: Vec<Field>,
+    /// Optional description/comment for the schema
+    pub description: Option<String>,
 }
 
 impl Schema {
     pub fn empty() -> &'static Self {
-        static EMPTY: Schema = Schema { fields: Vec::new() };
+        static EMPTY: Schema = Schema { fields: Vec::new(), description: None };
         &EMPTY
     }
 
@@ -150,7 +184,13 @@ impl Schema {
     }
 
     pub fn new(fields: Vec<Field>) -> Self {
-        Self { fields }
+        Self { fields, description: None }
+    }
+
+    /// Set the description for this schema
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
     }
 
     pub fn names(&self) -> Vec<String> {
@@ -233,6 +273,10 @@ impl Field {
         Self {
             data_type,
             name: name.into(),
+            is_not_null: None,
+            is_primary_key: None,
+            foreign_key: None,
+            description: None,
         }
     }
 
@@ -240,6 +284,10 @@ impl Field {
         Self {
             data_type,
             name: String::new(),
+            is_not_null: None,
+            is_primary_key: None,
+            foreign_key: None,
+            description: None,
         }
     }
 
@@ -247,10 +295,38 @@ impl Field {
         self.data_type.clone()
     }
 
+    /// Set the NOT NULL constraint for this field
+    pub fn with_not_null(mut self, is_not_null: bool) -> Self {
+        self.is_not_null = Some(is_not_null);
+        self
+    }
+
+    /// Set the primary key constraint for this field
+    pub fn with_primary_key(mut self, is_primary_key: bool) -> Self {
+        self.is_primary_key = Some(is_primary_key);
+        self
+    }
+
+    /// Set the foreign key constraint for this field
+    pub fn with_foreign_key(mut self, foreign_key: impl Into<String>) -> Self {
+        self.foreign_key = Some(foreign_key.into());
+        self
+    }
+
+    /// Set the description for this field
+    pub fn with_description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
     pub fn from_with_table_name_prefix(desc: &ColumnDesc, table_name: &str) -> Self {
         Self {
             data_type: desc.data_type.clone(),
             name: format!("{}.{}", table_name, desc.name),
+            is_not_null: None,
+            is_primary_key: None,
+            foreign_key: None,
+            description: desc.description.clone(),
         }
     }
 }
@@ -260,6 +336,10 @@ impl From<&PbField> for Field {
         Self {
             data_type: DataType::from(prost_field.get_data_type().expect("data type not found")),
             name: prost_field.get_name().clone(),
+            is_not_null: prost_field.is_not_null,
+            is_primary_key: prost_field.is_primary_key,
+            foreign_key: prost_field.foreign_key.clone(),
+            description: prost_field.description.clone(),
         }
     }
 }
@@ -276,6 +356,7 @@ impl FromIterator<Field> for Schema {
     fn from_iter<I: IntoIterator<Item = Field>>(iter: I) -> Self {
         Schema {
             fields: iter.into_iter().collect::<Vec<_>>(),
+            description: None,
         }
     }
 }
