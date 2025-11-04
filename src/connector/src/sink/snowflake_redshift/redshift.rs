@@ -188,26 +188,26 @@ impl Sink for RedshiftSink {
         if self.config.create_table_if_not_exists {
             let client = self.config.build_client()?;
             let schema = self.param.schema();
-            let build_table_sql = build_create_table_sql(
+            let build_table_sqls = build_create_table_sql(
                 self.config.schema.as_deref(),
                 &self.config.table,
                 &schema,
                 false,
             )?;
-            client.execute_sql_sync(vec![build_table_sql]).await?;
+            client.execute_sql_sync(build_table_sqls).await?;
             if !self.is_append_only {
                 let cdc_table = self.config.cdc_table.as_ref().ok_or_else(|| {
                     SinkError::Config(anyhow!(
                         "intermediate.table.name is required for append-only sink"
                     ))
                 })?;
-                let build_cdc_table_sql = build_create_table_sql(
+                let build_cdc_table_sqls = build_create_table_sql(
                     self.config.schema.as_deref(),
                     cdc_table,
                     &schema,
                     true,
                 )?;
-                client.execute_sql_sync(vec![build_cdc_table_sql]).await?;
+                client.execute_sql_sync(build_cdc_table_sqls).await?;
             }
         }
         Ok(())
@@ -741,25 +741,90 @@ pub fn build_create_table_sql(
     table_name: &str,
     schema: &Schema,
     need_op_and_row_id: bool,
-) -> Result<String> {
+) -> Result<Vec<String>> {
+    let mut sqls = Vec::new();
+    
+    // Generate column definitions with constraints
     let mut columns: Vec<String> = schema
         .fields
         .iter()
         .map(|field| {
             let data_type = convert_redshift_data_type(&field.data_type)?;
-            Ok(format!("{} {}", field.name, data_type))
+            let mut column_def = format!("{} {}", field.name, data_type);
+            
+            // Add NOT NULL constraint if specified
+            if field.is_not_null == Some(true) {
+                column_def.push_str(" NOT NULL");
+            }
+            
+            Ok(column_def)
         })
         .collect::<Result<Vec<String>>>()?;
+    
     if need_op_and_row_id {
         columns.push(format!("{} VARCHAR(MAX)", __ROW_ID));
         columns.push(format!("{} INT", __OP));
     }
+    
+    // Collect primary key columns
+    let pk_columns: Vec<&str> = schema
+        .fields
+        .iter()
+        .filter(|f| f.is_primary_key == Some(true))
+        .map(|f| f.name.as_str())
+        .collect();
+    
+    // Add PRIMARY KEY constraint if any columns are marked as primary key
+    if !pk_columns.is_empty() {
+        columns.push(format!("PRIMARY KEY ({})", pk_columns.join(", ")));
+    }
+    
+    // Add foreign key constraints
+    for field in &schema.fields {
+        if let Some(ref fk) = field.foreign_key {
+            columns.push(format!(
+                "FOREIGN KEY ({}) REFERENCES {}",
+                field.name, fk
+            ));
+        }
+    }
+    
     let columns_str = columns.join(", ");
     let full_table_name = build_full_table_name(schema_name, table_name);
-    Ok(format!(
+    
+    // Main CREATE TABLE statement
+    sqls.push(format!(
         "CREATE TABLE IF NOT EXISTS {} ({})",
         full_table_name, columns_str
-    ))
+    ));
+    
+    // Add table comment if schema has a description
+    if let Some(ref table_desc) = schema.description {
+        sqls.push(format!(
+            "COMMENT ON TABLE {} IS '{}'",
+            full_table_name,
+            escape_sql_string(table_desc)
+        ));
+    }
+    
+    // Add column comments for fields with descriptions
+    for field in &schema.fields {
+        if let Some(ref desc) = field.description {
+            sqls.push(format!(
+                "COMMENT ON COLUMN {}.{} IS '{}'",
+                full_table_name,
+                field.name,
+                escape_sql_string(desc)
+            ));
+        }
+    }
+    
+    Ok(sqls)
+}
+
+/// Escapes single quotes in SQL strings by doubling them
+fn escape_sql_string(s: &str) -> String {
+    s.replace('\'', "''")
 }
 
 fn convert_redshift_data_type(data_type: &DataType) -> Result<String> {
@@ -925,4 +990,186 @@ fn build_copy_into_sql(
         manifest_path = manifest_path,
         credentials = credentials
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use risingwave_common::types::DataType;
+
+    #[test]
+    fn test_build_create_table_sql_basic() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64),
+            Field::new("name", DataType::Varchar),
+        ]);
+
+        let sqls = build_create_table_sql(None, "users", &schema, false).unwrap();
+        
+        assert_eq!(sqls.len(), 1);
+        assert_eq!(
+            sqls[0],
+            r#"CREATE TABLE IF NOT EXISTS "users" (id BIGINT, name VARCHAR(MAX))"#
+        );
+    }
+
+    #[test]
+    fn test_build_create_table_sql_with_not_null() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64).with_not_null(true),
+            Field::new("name", DataType::Varchar).with_not_null(true),
+            Field::new("email", DataType::Varchar),
+        ]);
+
+        let sqls = build_create_table_sql(None, "users", &schema, false).unwrap();
+        
+        assert_eq!(sqls.len(), 1);
+        assert_eq!(
+            sqls[0],
+            r#"CREATE TABLE IF NOT EXISTS "users" (id BIGINT NOT NULL, name VARCHAR(MAX) NOT NULL, email VARCHAR(MAX))"#
+        );
+    }
+
+    #[test]
+    fn test_build_create_table_sql_with_primary_key() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64)
+                .with_not_null(true)
+                .with_primary_key(true),
+            Field::new("name", DataType::Varchar),
+        ]);
+
+        let sqls = build_create_table_sql(None, "users", &schema, false).unwrap();
+        
+        assert_eq!(sqls.len(), 1);
+        assert_eq!(
+            sqls[0],
+            r#"CREATE TABLE IF NOT EXISTS "users" (id BIGINT NOT NULL, name VARCHAR(MAX), PRIMARY KEY (id))"#
+        );
+    }
+
+    #[test]
+    fn test_build_create_table_sql_with_composite_primary_key() {
+        let schema = Schema::new(vec![
+            Field::new("order_id", DataType::Int64)
+                .with_not_null(true)
+                .with_primary_key(true),
+            Field::new("item_id", DataType::Int64)
+                .with_not_null(true)
+                .with_primary_key(true),
+            Field::new("quantity", DataType::Int32),
+        ]);
+
+        let sqls = build_create_table_sql(None, "order_items", &schema, false).unwrap();
+        
+        assert_eq!(sqls.len(), 1);
+        assert_eq!(
+            sqls[0],
+            r#"CREATE TABLE IF NOT EXISTS "order_items" (order_id BIGINT NOT NULL, item_id BIGINT NOT NULL, quantity INTEGER, PRIMARY KEY (order_id, item_id))"#
+        );
+    }
+
+    #[test]
+    fn test_build_create_table_sql_with_foreign_key() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64)
+                .with_not_null(true)
+                .with_primary_key(true),
+            Field::new("user_id", DataType::Int64)
+                .with_not_null(true)
+                .with_foreign_key("users(id)"),
+        ]);
+
+        let sqls = build_create_table_sql(None, "orders", &schema, false).unwrap();
+        
+        assert_eq!(sqls.len(), 1);
+        assert_eq!(
+            sqls[0],
+            r#"CREATE TABLE IF NOT EXISTS "orders" (id BIGINT NOT NULL, user_id BIGINT NOT NULL, PRIMARY KEY (id), FOREIGN KEY (user_id) REFERENCES users(id))"#
+        );
+    }
+
+    #[test]
+    fn test_build_create_table_sql_with_table_comment() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64),
+            Field::new("name", DataType::Varchar),
+        ])
+        .with_description("User information table");
+
+        let sqls = build_create_table_sql(None, "users", &schema, false).unwrap();
+        
+        assert_eq!(sqls.len(), 2);
+        assert_eq!(
+            sqls[0],
+            r#"CREATE TABLE IF NOT EXISTS "users" (id BIGINT, name VARCHAR(MAX))"#
+        );
+        assert_eq!(
+            sqls[1],
+            r#"COMMENT ON TABLE "users" IS 'User information table'"#
+        );
+    }
+
+    #[test]
+    fn test_build_create_table_sql_with_column_comments() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64)
+                .with_description("Unique identifier"),
+            Field::new("name", DataType::Varchar)
+                .with_description("User''s full name"),
+        ]);
+
+        let sqls = build_create_table_sql(None, "users", &schema, false).unwrap();
+        
+        assert_eq!(sqls.len(), 3);
+        assert_eq!(
+            sqls[0],
+            r#"CREATE TABLE IF NOT EXISTS "users" (id BIGINT, name VARCHAR(MAX))"#
+        );
+        assert_eq!(
+            sqls[1],
+            r#"COMMENT ON COLUMN "users".id IS 'Unique identifier'"#
+        );
+        assert_eq!(
+            sqls[2],
+            r#"COMMENT ON COLUMN "users".name IS 'User''''s full name'"#
+        );
+    }
+
+    #[test]
+    fn test_build_create_table_sql_with_schema_name() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64),
+            Field::new("name", DataType::Varchar),
+        ]);
+
+        let sqls = build_create_table_sql(Some("public"), "users", &schema, false).unwrap();
+        
+        assert_eq!(sqls.len(), 1);
+        assert_eq!(
+            sqls[0],
+            r#"CREATE TABLE IF NOT EXISTS "public"."users" (id BIGINT, name VARCHAR(MAX))"#
+        );
+    }
+
+    #[test]
+    fn test_build_create_table_sql_with_op_and_row_id() {
+        let schema = Schema::new(vec![
+            Field::new("id", DataType::Int64),
+            Field::new("name", DataType::Varchar),
+        ]);
+
+        let sqls = build_create_table_sql(None, "users", &schema, true).unwrap();
+        
+        assert_eq!(sqls.len(), 1);
+        assert!(sqls[0].contains("__row_id VARCHAR(MAX)"));
+        assert!(sqls[0].contains("__op INT"));
+    }
+
+    #[test]
+    fn test_escape_sql_string() {
+        assert_eq!(escape_sql_string("simple text"), "simple text");
+        assert_eq!(escape_sql_string("text with 'quotes'"), "text with ''quotes''");
+        assert_eq!(escape_sql_string("it's"), "it''s");
+    }
 }
